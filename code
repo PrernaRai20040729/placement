@@ -1,0 +1,171 @@
+// interrupt-handler.ts
+// TypeScript - a single-file logic-layer for intelligent interruption handling
+// Usage: instantiate InterruptHandler and hook its handlers to your VAD/STT/audio events.
+
+import EventEmitter from "events";
+
+/**
+ * Configuration interface
+ */
+export interface InterruptHandlerConfig {
+  ignoreWords: string[];       // soft tokens; when speaking, these are ignored if present alone
+  interruptWords: string[];    // urgent words -> always interrupt
+  minTokenCountForIgnore?: number; // only ignore if transcript token count <= this (default 3)
+  partialTimeoutMs?: number;   // how long to wait for partial STT before deciding (default 250ms)
+}
+
+/**
+ * Events emitted by the handler to communicate back to the agent.
+ * "interrupt" -> agent should stop speaking and switch to listening/handle user command.
+ * "consume-as-input" -> when agent is silent and the phrase should be handled as user input.
+ */
+export type HandlerEvents = {
+  interrupt: (transcript: string) => void;
+  continue: (reason: string) => void;
+  consumeAsInput: (transcript: string) => void;
+};
+
+export class InterruptHandler extends EventEmitter {
+  private config: InterruptHandlerConfig;
+  private agentSpeaking = false;
+  private pendingVAD = false;
+  private partialTimer?: NodeJS.Timeout;
+  private lastPartialTranscript = "";
+
+  constructor(config?: Partial<InterruptHandlerConfig>) {
+    super();
+    const defaultConfig: InterruptHandlerConfig = {
+      ignoreWords: ["yeah", "ok", "hmm", "right", "uh-huh"],
+      interruptWords: ["wait", "stop", "no", "hold", "pause", "cancel"],
+      minTokenCountForIgnore: 3,
+      partialTimeoutMs: 250,
+    };
+    this.config = { ...defaultConfig, ...(config || {}) };
+    // normalize to lowercase for easy matching
+    this.config.ignoreWords = this.config.ignoreWords.map(w => w.toLowerCase());
+    this.config.interruptWords = this.config.interruptWords.map(w => w.toLowerCase());
+  }
+
+  // Set agent speaking state externally (e.g., when TTS starts/stops)
+  public setAgentSpeaking(isSpeaking: boolean) {
+    this.agentSpeaking = isSpeaking;
+    // reset pending state if agent just stopped
+    if (!isSpeaking) {
+      this.clearPending();
+    }
+  }
+
+  // Called when VAD reports user voice detected
+  public onVADStart() {
+    // If VAD fires, start a short timer and wait for STT partial/final before stopping audio
+    this.pendingVAD = true;
+    // reset lastPartialTranscript
+    this.lastPartialTranscript = "";
+    // If STT partials arrive, they will decide; otherwise, after timeout, fall back to final logic
+    if (this.partialTimer) clearTimeout(this.partialTimer);
+    this.partialTimer = setTimeout(() => {
+      // fallback: No partial transcript could be received in time.
+      // Conservative default: do not interrupt if agent is speaking (to avoid false stop).
+      // If agent is silent, treat as normal input (we will ask STT final or re-check)
+      this.pendingVAD = false;
+      if (this.agentSpeaking) {
+        this.emit("continue", "VAD timeout while speaking: no interrupt");
+      } else {
+        // agent silent: treat as input (best-effort)
+        this.emit("consumeAsInput", "");
+      }
+    }, this.config.partialTimeoutMs);
+  }
+
+  // Called whenever STT partial transcript arrives (low-latency)
+  public onSTTPartial(partial: string) {
+    this.lastPartialTranscript = partial.trim();
+    if (!this.pendingVAD) return; // no active VAD event to resolve
+    // evaluate partial transcript fast
+    const decision = this.evaluateTranscript(this.lastPartialTranscript);
+    if (decision === "interrupt") {
+      this.clearPending();
+      this.emit("interrupt", this.lastPartialTranscript);
+    } else if (decision === "ignore") {
+      // if speaking, keep playing; if silent, consume as input
+      this.clearPending();
+      if (this.agentSpeaking) {
+        this.emit("continue", "Partial indicates only ignored tokens while speaking");
+      } else {
+        // if agent silent, treat as reply
+        this.emit("consumeAsInput", this.lastPartialTranscript);
+      }
+    } else {
+      // ambiguous -> wait for more partials or final; leave timer running
+      // No action yet
+    }
+  }
+
+  // Called when STT final transcript arrives for the utterance
+  public onSTTFinal(finalTranscript: string) {
+    this.lastPartialTranscript = finalTranscript.trim();
+    if (!this.pendingVAD) {
+      // no pending VAD: either agent silent and user spoke normally, or previous event resolved
+      if (this.agentSpeaking) {
+        // agent speaking + late final transcript: decide but be conservative
+        const dec = this.evaluateTranscript(this.lastPartialTranscript);
+        if (dec === "interrupt") this.emit("interrupt", this.lastPartialTranscript);
+        else this.emit("continue", "Final arrived but no pending VAD -> continuing");
+      } else {
+        // agent silent => consume
+        this.emit("consumeAsInput", this.lastPartialTranscript);
+      }
+      return;
+    }
+
+    // evaluate and decide
+    const decision = this.evaluateTranscript(this.lastPartialTranscript);
+    this.clearPending();
+    if (decision === "interrupt") this.emit("interrupt", this.lastPartialTranscript);
+    else if (decision === "ignore") {
+      if (this.agentSpeaking) this.emit("continue", "Final says ignore");
+      else this.emit("consumeAsInput", this.lastPartialTranscript);
+    } else {
+      // ambiguous -> treat as consume when silent, continue when speaking
+      if (this.agentSpeaking) this.emit("continue", "Final ambiguous but agent speaking: continue");
+      else this.emit("consumeAsInput", this.lastPartialTranscript);
+    }
+  }
+
+  // Evaluate transcript: return 'interrupt' | 'ignore' | 'ambiguous'
+  private evaluateTranscript(text: string): "interrupt" | "ignore" | "ambiguous" {
+    if (!text) return "ambiguous";
+    const lower = text.toLowerCase();
+    // normalize punctuation -> split tokens
+    const tokens = lower.replace(/[^\w\s'-]/g, "").split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return "ambiguous";
+
+    // 1) If contains any interrupt word -> interrupt
+    for (const w of this.config.interruptWords) {
+      if (tokens.includes(w)) return "interrupt";
+    }
+
+    // 2) If all tokens are subset of ignoreWords and token count small -> ignore
+    const allIgnored = tokens.every(t => this.config.ignoreWords.includes(t));
+    if (allIgnored && tokens.length <= (this.config.minTokenCountForIgnore || 3)) return "ignore";
+
+    // 3) If contains other words (commands, longer sentences) -> interrupt (semantic)
+    // We consider presence of more than ignore words as meaningful (e.g., "yeah wait" caught earlier)
+    // But if agent is speaking and there's a short multi-word utterance like "yeah okay" (both ignored),
+    // that was handled above. Otherwise, treat as interrupt.
+    // To be conservative, if tokens contain at least one token not in ignoreWords, mark as interrupt.
+    const hasNonIgnore = tokens.some(t => !this.config.ignoreWords.includes(t));
+    if (hasNonIgnore) return "interrupt";
+
+    return "ambiguous";
+  }
+
+  private clearPending() {
+    this.pendingVAD = false;
+    if (this.partialTimer) {
+      clearTimeout(this.partialTimer);
+      this.partialTimer = undefined;
+    }
+    this.lastPartialTranscript = "";
+  }
+}
